@@ -32,18 +32,26 @@ def main():
     x1, x2 = v_lines[0] + CELL_MARGIN, v_lines[1] - CELL_MARGIN
 
     cell = image[y1:y2, x1:x2]
-    cell_h, cell_w = cell.shape[:2]
+    cell_height, cell_width = cell.shape[:2]
 
-    code_h = int(cell_h * ratio)
-    code_side = min(cell_w, code_h)
+    estimated_code_height = int(cell_height * ratio)
+    # Код квадратный — сторона ограничена меньшей из двух величин
+    code_side = min(cell_width, estimated_code_height)
+    # Центрируем по горизонтали
+    x_offset = (cell_width - code_side) // 2
 
-    crop = cell[0:code_side, 0:code_side]
+    y1 = 5
+    y2 = min(cell_height, int(cell_height * ratio))
+    x1 = x_offset
+    x2 = x_offset + code_side
+
+    crop = cell[y1:y2, x1:x2]
 
     cv2.imwrite("calibration_cell_full.png", cell)
     cv2.imwrite("calibration_code_crop.png", crop)
 
-    print(f"Ячейка: {cell_w}x{cell_h}")
-    print(f"Вычисленная зона кода: {code_side}x{code_side} (ratio={ratio})")
+    print(f"Ячейка: {cell_width}x{cell_height}")
+    print(f"Вычисленная зона кода: {x1} . {y1} x {x2} . {y2} (ratio={ratio})")
     print("Сохранено: calibration_cell_full.png, calibration_code_crop.png")
     print("Проверьте визуально: в calibration_code_crop.png должен быть виден")
     print("только сам DataMatrix, без текста подписи снизу.")
