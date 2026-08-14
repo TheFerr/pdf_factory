@@ -87,9 +87,14 @@ file_put_contents($statusFile, json_encode($initialStatus));
 
 // Запускаем Python-агентов асинхронно (пример команды)
 // Агент сам обновляет status.json на каждом шаге, включая переключение stage=2
+
 $pdfListArg = escapeshellarg(implode(',', $savedFiles));
+
+$pythonBin = __DIR__ . '/venv/bin/python3';
+
 $cmd = sprintf(
-    'nohup python3 %s --job_dir=%s --pdf_dir=%s --png_dir=%s --csv_dir=%s --status_file=%s --result_count=%d --files=%s > %s 2>&1 &',
+    'nohup %s %s --job_dir=%s --pdf_dir=%s --png_dir=%s --csv_dir=%s --status_file=%s --result_count=%d --files=%s > %s 2>&1 &',
+    escapeshellarg($pythonBin),
     escapeshellarg(__DIR__ . '/agents/run_pipeline.py'),
     escapeshellarg($jobDir),
     escapeshellarg($pdfDir),
@@ -100,6 +105,7 @@ $cmd = sprintf(
     $pdfListArg,
     escapeshellarg("$jobDir/pipeline.log")
 );
+
 exec($cmd);
 
 respond(true, ['session_id' => $sessionId]);
