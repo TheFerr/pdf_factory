@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Агент 2: Поиск и распознавание Data Matrix кодов на PNG страницах,
-экспорт результатов в текстовые файлы с последующим равномерным
-разбиением на заданное количество результирующих файлов.
+Агент 2: Поиск и распознавание Data Matrix кодов на PNG страницах
+через анализ проекций (projection profile) линий сетки.
 
-Алгоритм поиска кодов на странице:
-    1. Бинаризация изображения (коды чёрные на белом фоне).
-    2. Поиск контуров через cv2.findContours.
-    3. Фильтрация контуров по геометрии (площадь, аспект-ratio ~ квадрат) —
-       так отсекаются случайные артефакты и текстовые блоки, если такие есть.
-    4. Кластеризация найденных прямоугольников в сетку строка/столбец
-       (до 4 строк, до 5 столбцов) на основании коллинеарности границ.
-    5. Сортировка кодов по порядку чтения: сверху-вниз, слева-направо.
-    6. Crop каждого кода с небольшим отступом (padding) и распознавание
-       через pylibdmtx.
+Метод расчитан на синтезированные PDF с чёткими прямыми чёрными
+линиями рамок на белом фоне (не сканы) — поиск сетки выполняется
+через суммирование тёмных пикселей по строкам/столбцам, что даёт
+высокую надёжность и скорость по сравнению с контурным анализом.
+
+Алгоритм на странице:
+    1. Бинаризация (тёмные элементы становятся "1").
+    2. Вертикальная проекция -> находим X-координаты вертикальных линий сетки.
+    3. Горизонтальная проекция -> находим Y-координаты горизонтальных линий сетки.
+    4. Ячейки сетки = пересечения найденных линий (rows x cols, до 4 x 5).
+    5. Для каждой ячейки: crop с отступом от линии, декодирование
+       Data Matrix с каскадом fallback-стратегий (raw -> gray ->
+       upscale -> Otsu threshold).
 
 Каждые 5 обработанных PNG агент обновляет status.json.
 
@@ -44,265 +46,195 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from status_manager import StatusManager
 
 
-# ---------- Константы конфигурации алгоритма поиска ----------
+# ---------- Константы конфигурации алгоритма поиска сетки ----------
 
 MAX_ROWS = 4
 MAX_COLS = 5
 
-# Ожидаемая доля площади одного кода относительно площади страницы.
-# Используется как первичный фильтр для отсечения слишком мелких
-# (шум/артефакты) или слишком крупных (случайно слипшиеся) контуров.
-MIN_CODE_AREA_RATIO = 0.001
-MAX_CODE_AREA_RATIO = 0.15
+# Порог бинаризации: пиксели темнее этого значения считаются
+# частью линии сетки / кода. Для синтезированных чёрно-белых PDF
+# со строгими границами 220 — надёжное значение (как в эталонном коде).
+BINARY_THRESHOLD = 220
 
-# Допустимое отклонение от квадратной формы рамки кода (аспект-ratio).
-# Data Matrix почти всегда квадратный, но небольшая погрешность
-# сканирования/скана допустима.
-ASPECT_RATIO_TOLERANCE = 0.25
+# Доля высоты/ширины страницы, которую должна перекрывать линия,
+# чтобы считаться частью сетки (а не, например, штрихом внутри кода).
+VERTICAL_LINE_RATIO = 0.60
+HORIZONTAL_LINE_RATIO = 0.60
 
-# Отступ (в пикселях) добавляемый при crop кода — небольшой запас
-# помогает libdmtx корректнее находить finder pattern по краям.
-CROP_PADDING = 6
+# Максимальный разрыв между соседними "тёмными" координатами
+# при группировке в одну линию (учитывает антиалиасинг/толщину линии).
+LINE_GROUPING_MAX_GAP = 5
 
-# Порог группировки центров кодов в одну строку (по Y),
-# рассчитывается динамически как доля от среднего размера кода,
-# но имеет минимальное абсолютное значение на случай мелких кодов.
-ROW_GROUPING_MIN_PX = 15
+# Отступ от найденной линии сетки внутрь ячейки перед crop —
+# исключает саму линию рамки из вырезаемой области кода.
+CELL_MARGIN = 3
 
-# Через сколько обработанных PNG обновлять status.json
+# Через сколько обработанных PNG обновлять status.json.
+# Декодирование Data Matrix — CPU-затратная операция (до 20 кодов
+# на страницу с возможным каскадом из 4 попыток каждый),
+# поэтому обновляем статус не на каждой странице, а пакетно.
 STATUS_UPDATE_INTERVAL = 5
 
-
-class DetectedCode:
-    """Представляет один найденный на странице код с его геометрией."""
-
-    __slots__ = ["x", "y", "w", "h", "center_x", "center_y", "image"]
-
-    def __init__(self, x: int, y: int, w: int, h: int, image: np.ndarray):
-        self.x = x
-        self.y = y
-        self.w = w
-        self.h = h
-        self.center_x = x + w / 2
-        self.center_y = y + h / 2
-        self.image = image
+# Метка для нераспознанного кода — сохраняет позиционную
+# целостность результата (ячейка физически была, но не считалась).
+UNREADABLE_MARK = "ERROR"
 
 
-def find_code_contours(gray_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
+def group_lines(points: np.ndarray, max_gap: int = LINE_GROUPING_MAX_GAP) -> List[int]:
     """
-    Находит прямоугольные контуры-кандидаты на роль рамок Data Matrix кодов.
+    Объединяет соседние координаты тёмных пикселей в единые линии сетки.
 
-    Возвращает список bounding box'ов в формате (x, y, w, h).
+    Например, [206, 207, 208, 209, 210] (толщина линии в несколько
+    пикселей из-за антиалиасинга) схлопывается в единую координату
+    центра линии: 208.
+
+    Возвращает список центров найденных линий.
     """
-    page_area = gray_image.shape[0] * gray_image.shape[1]
-    min_area = page_area * MIN_CODE_AREA_RATIO
-    max_area = page_area * MAX_CODE_AREA_RATIO
-
-    # Бинаризация: коды чёрные на белом фоне, поэтому инвертируем,
-    # чтобы рамки стали белыми объектами на чёрном фоне для findContours.
-    _, binary = cv2.threshold(
-        gray_image, 0, 255,
-        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
-
-    # Небольшая морфологическая операция закрытия — помогает соединить
-    # разрывы в тонкой рамке кода, если скан не идеально чистый.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    contours, hierarchy = cv2.findContours(
-        binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    candidates = []
-
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < min_area or area > max_area:
-            continue
-
-        x, y, w, h = cv2.boundingRect(contour)
-
-        if h == 0:
-            continue
-
-        aspect_ratio = w / h
-        if abs(aspect_ratio - 1.0) > ASPECT_RATIO_TOLERANCE:
-            continue
-
-        # Дополнительная проверка: контур должен быть достаточно
-        # "прямоугольным" (площадь контура близка к площади bounding box),
-        # это отсекает неровные пятна/шум.
-        bbox_area = w * h
-        if bbox_area == 0:
-            continue
-
-        fill_ratio = area / bbox_area
-        if fill_ratio < 0.5:
-            continue
-
-        candidates.append((x, y, w, h))
-
-    return candidates
-
-
-def deduplicate_nested_boxes(
-    boxes: List[Tuple[int, int, int, int]]
-) -> List[Tuple[int, int, int, int]]:
-    """
-    Рамка кода на изображении часто даёт два вложенных контура
-    (внешний и внутренний край линии рамки). Оставляем только
-    внешний (больший) прямоугольник среди сильно перекрывающихся.
-    """
-    if not boxes:
+    if len(points) == 0:
         return []
 
-    # Сортируем по площади по убыванию — сначала крупные (внешние) рамки
-    boxes_sorted = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-    kept = []
+    groups = []
+    start = points[0]
+    previous = points[0]
 
-    def iou(box_a, box_b) -> float:
-        ax, ay, aw, ah = box_a
-        bx, by, bw, bh = box_b
-
-        inter_x1 = max(ax, bx)
-        inter_y1 = max(ay, by)
-        inter_x2 = min(ax + aw, bx + bw)
-        inter_y2 = min(ay + ah, by + bh)
-
-        inter_w = max(0, inter_x2 - inter_x1)
-        inter_h = max(0, inter_y2 - inter_y1)
-        inter_area = inter_w * inter_h
-
-        area_a = aw * ah
-        area_b = bw * bh
-        union_area = area_a + area_b - inter_area
-
-        return inter_area / union_area if union_area > 0 else 0
-
-    for box in boxes_sorted:
-        is_duplicate = any(iou(box, kept_box) > 0.6 for kept_box in kept)
-        if not is_duplicate:
-            kept.append(box)
-
-    return kept
-
-
-def arrange_codes_in_grid(
-    boxes: List[Tuple[int, int, int, int]]
-) -> List[Tuple[int, int, int, int]]:
-    """
-    Кластеризует найденные прямоугольники в логическую сетку
-    (строки/столбцы) и возвращает их в порядке чтения:
-    сверху-вниз по строкам, слева-направо внутри строки.
-
-    Опирается на коллинеарность рамок по вертикали/горизонтали,
-    заявленную в исходных данных страницы.
-    """
-    if not boxes:
-        return []
-
-    # Средняя высота кода используется для расчёта допуска группировки в строки
-    avg_height = sum(b[3] for b in boxes) / len(boxes)
-    row_threshold = max(ROW_GROUPING_MIN_PX, avg_height * 0.5)
-
-    # Сортируем все боксы по Y для последовательной кластеризации в строки
-    boxes_by_y = sorted(boxes, key=lambda b: b[1])
-
-    rows: List[List[Tuple[int, int, int, int]]] = []
-    current_row = [boxes_by_y[0]]
-    current_row_y = boxes_by_y[0][1]
-
-    for box in boxes_by_y[1:]:
-        if abs(box[1] - current_row_y) <= row_threshold:
-            current_row.append(box)
+    for point in points[1:]:
+        if point - previous <= max_gap:
+            previous = point
         else:
-            rows.append(current_row)
-            current_row = [box]
-            current_row_y = box[1]
+            groups.append((start, previous))
+            start = point
+            previous = point
 
-    rows.append(current_row)
+    groups.append((start, previous))
 
-    # Ограничиваем количество строк заявленным максимумом (защита от шума)
-    rows = rows[:MAX_ROWS]
-
-    # Внутри каждой строки сортируем по X (порядок столбцов слева-направо)
-    ordered_boxes = []
-    for row in rows:
-        row_sorted = sorted(row, key=lambda b: b[0])[:MAX_COLS]
-        ordered_boxes.extend(row_sorted)
-
-    return ordered_boxes
+    return [(g_start + g_end) // 2 for g_start, g_end in groups]
 
 
-def crop_code_image(
-    gray_image: np.ndarray, box: Tuple[int, int, int, int]
-) -> np.ndarray:
-    """Вырезает область кода с небольшим padding для надёжности декодирования."""
-    x, y, w, h = box
-    img_h, img_w = gray_image.shape[:2]
-
-    x1 = max(0, x - CROP_PADDING)
-    y1 = max(0, y - CROP_PADDING)
-    x2 = min(img_w, x + w + CROP_PADDING)
-    y2 = min(img_h, y + h + CROP_PADDING)
-
-    return gray_image[y1:y2, x1:x2]
-
-
-def decode_data_matrix(cropped_image: np.ndarray) -> Optional[str]:
+def find_grid_lines(
+    gray_image: np.ndarray
+) -> Tuple[List[int], List[int]]:
     """
-    Распознаёт Data Matrix код из вырезанного изображения через pylibdmtx.
+    Находит координаты вертикальных и горизонтальных линий сетки
+    через анализ проекций тёмных пикселей.
 
-    Возвращает распознанную строку либо None, если код не распознан.
+    Принимает изображение в оттенках серого (не BGR) — конвертация
+    из cv2.imread выполняется один раз при загрузке страницы,
+    а не повторно на каждом вызове этой функции.
+
+    Возвращает (vertical_line_positions, horizontal_line_positions).
     """
-    try:
-        # timeout защищает от редких случаев зависания libdmtx
-        # на сильно зашумлённых/повреждённых изображениях
-        results = dmtx_decode(cropped_image, timeout=2000, max_count=1)
+    _, binary = cv2.threshold(
+        gray_image, BINARY_THRESHOLD, 255, cv2.THRESH_BINARY_INV
+    )
 
-        if results:
-            return results[0].data.decode("utf-8", errors="replace").strip()
+    height, width = binary.shape
 
-    except Exception:
-        # Ошибка декодирования конкретного кода не должна прерывать
-        # обработку всей страницы — просто фиксируем как нераспознанный
-        pass
+    vertical_projection = np.sum(binary > 0, axis=0)
+    horizontal_projection = np.sum(binary > 0, axis=1)
+
+    vertical_threshold = height * VERTICAL_LINE_RATIO
+    horizontal_threshold = width * HORIZONTAL_LINE_RATIO
+
+    vertical_candidates = np.where(vertical_projection > vertical_threshold)[0]
+    horizontal_candidates = np.where(horizontal_projection > horizontal_threshold)[0]
+
+    vertical_lines = group_lines(vertical_candidates)
+    horizontal_lines = group_lines(horizontal_candidates)
+
+    return vertical_lines, horizontal_lines
+
+
+def decode_datamatrix(cell_bgr: np.ndarray) -> Optional[bytes]:
+    """
+    Распознаёт Data Matrix код из вырезанной ячейки с каскадом
+    fallback-стратегий возрастающей "агрессивности" обработки.
+
+    Порядок попыток (от самой быстрой к самой тяжёлой):
+        1. Исходное BGR изображение как есть.
+        2. Grayscale версия.
+        3. Grayscale с увеличением в 2 раза (кубическая интерполяция) —
+           помогает при мелких кодах, где размер модуля близок к 1 пикселю.
+        4. Бинаризация по Otsu поверх увеличенного изображения —
+           последний шанс для контрастных, но зашумлённых ячеек.
+
+    Возвращает сырые байты декодированных данных либо None.
+    """
+    result = dmtx_decode(cell_bgr, max_count=1)
+    if result:
+        return result[0].data
+
+    gray = cv2.cvtColor(cell_bgr, cv2.COLOR_BGR2GRAY)
+    result = dmtx_decode(gray, max_count=1)
+    if result:
+        return result[0].data
+
+    enlarged = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    result = dmtx_decode(enlarged, max_count=1)
+    if result:
+        return result[0].data
+
+    _, binary = cv2.threshold(enlarged, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    result = dmtx_decode(binary, max_count=1)
+    if result:
+        return result[0].data
 
     return None
 
 
-def process_single_page(
-    png_path: str, status: StatusManager
-) -> List[str]:
+def process_single_page(png_path: str, status: StatusManager) -> List[str]:
     """
-    Обрабатывает одну PNG страницу: находит все коды, распознаёт их,
-    возвращает список распознанных строк в порядке чтения (сетка).
+    Обрабатывает одну PNG страницу: находит сетку линий, вырезает
+    каждую ячейку и распознаёт код внутри неё.
 
-    Нераспознанные коды помечаются как "UNREADABLE" — это позволяет
-    сохранить позиционную структуру результата и не терять информацию
-    о том, что на этом месте код присутствовал, но не считался.
+    Возвращает список распознанных строк в порядке чтения:
+    сверху-вниз по строкам, слева-направо внутри строки —
+    это естественный порядок, так как ячейки перебираются
+    напрямую по индексам найденной сетки (rows x cols).
     """
-    image = cv2.imread(png_path, cv2.IMREAD_GRAYSCALE)
+    image = cv2.imread(png_path)  # BGR, как в эталонном алгоритме
 
     if image is None:
         status.add_log(f"[Stage2] ОШИБКА: не удалось открыть {os.path.basename(png_path)}")
         return []
 
-    raw_boxes = find_code_contours(image)
-    deduped_boxes = deduplicate_nested_boxes(raw_boxes)
-    ordered_boxes = arrange_codes_in_grid(deduped_boxes)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    vertical_lines, horizontal_lines = find_grid_lines(gray)
+
+    cols = len(vertical_lines) - 1
+    rows = len(horizontal_lines) - 1
+
+    if rows <= 0 or cols <= 0:
+        status.add_log(
+            f"[Stage2] ПРЕДУПРЕЖДЕНИЕ: сетка не найдена на {os.path.basename(png_path)}"
+        )
+        return []
+
+    # Защита от аномального результата проекции (шум дал лишние линии) —
+    # обрезаем по заявленным максимумам сетки.
+    rows = min(rows, MAX_ROWS)
+    cols = min(cols, MAX_COLS)
 
     decoded_values = []
 
-    for box in ordered_boxes:
-        cropped = crop_code_image(image, box)
-        decoded_text = decode_data_matrix(cropped)
+    for row in range(rows):
+        y1 = horizontal_lines[row] + CELL_MARGIN
+        y2 = horizontal_lines[row + 1] - CELL_MARGIN
 
-        if decoded_text:
-            decoded_values.append(decoded_text)
-        else:
-            decoded_values.append("UNREADABLE")
+        for col in range(cols):
+            x1 = vertical_lines[col] + CELL_MARGIN
+            x2 = vertical_lines[col + 1] - CELL_MARGIN
+
+            if x2 <= x1 or y2 <= y1:
+                decoded_values.append(UNREADABLE_MARK)
+                continue
+
+            cell = image[y1:y2, x1:x2]
+            data = decode_datamatrix(cell)
+
+            if data is None:
+                decoded_values.append(UNREADABLE_MARK)
+            else:
+                decoded_values.append(data.decode("ascii", errors="replace"))
 
     return decoded_values
 
@@ -311,8 +243,9 @@ def collect_png_files(png_dir: str) -> List[str]:
     """
     Собирает полные пути всех PNG страниц из всех подпапок
     (каждая подпапка соответствует одному исходному PDF),
-    в порядке: сортировка по имени папки, затем по имени файла
-    (нумерация страниц с ведущими нулями обеспечивает верный порядок).
+    в порядке: сортировка по имени папки, затем по имени файла.
+    Нумерация страниц с ведущими нулями (из Агента 1) обеспечивает
+    корректный порядок сортировки.
     """
     all_png_paths = []
 
@@ -335,13 +268,12 @@ def write_ascii_lines(lines: List[str], output_path: str) -> None:
     """
     Записывает строки в ASCII файл с явным CRLF на конце каждой строки.
 
-    Открываем файл в бинарном режиме ('wb'), чтобы избежать автоматической
-    трансляции переводов строк операционной системой (например, Windows
-    иначе продублировал бы \\r при записи текстового '\\n' в текстовом режиме).
+    Используется бинарный режим записи для гарантии одинакового
+    результата независимо от ОС, на которой развёрнут сервер
+    (текстовый режим на разных платформах по-разному транслирует \\n).
     """
     with open(output_path, "wb") as f:
         for line in lines:
-            # Гарантируем чистый ASCII: заменяем не-ASCII символы на '?'
             ascii_line = line.encode("ascii", errors="replace").decode("ascii")
             f.write(ascii_line.encode("ascii"))
             f.write(b"\r\n")
@@ -352,20 +284,16 @@ def split_into_result_files(
 ) -> List[str]:
     """
     Делит общий список строк на result_count файлов с примерно
-    равным количеством строк на файл.
+    равным количеством строк на файл. Остаток распределяется
+    по первым файлам (разница между файлами не более 1 строки).
 
-    Имена результирующих файлов фиксированы по шаблону result_N.csv,
-    как того требует контракт с фронтендом (PHP формирует ссылки
-    на скачивание по этому же шаблону имён).
-
-    Возвращает список имён созданных файлов (без пути).
+    Имена результирующих файлов фиксированы по шаблону result_N.csv.
     """
     total_lines = len(all_lines)
 
     if total_lines == 0:
         return []
 
-    # Не создаём больше файлов, чем есть строк
     effective_result_count = min(result_count, total_lines)
 
     base_lines_per_file = total_lines // effective_result_count
@@ -375,8 +303,6 @@ def split_into_result_files(
     current_index = 0
 
     for file_number in range(1, effective_result_count + 1):
-        # Распределяем остаток по первым файлам, чтобы разница
-        # в количестве строк между файлами была не более 1 строки
         lines_in_this_file = base_lines_per_file + (1 if file_number <= remainder else 0)
 
         chunk = all_lines[current_index:current_index + lines_in_this_file]
@@ -423,14 +349,8 @@ def run(png_dir: str, csv_dir: str, status_file: str, result_count: int) -> List
         page_lines = process_single_page(png_path, status)
         all_decoded_lines.extend(page_lines)
 
-        unreadable_count += sum(1 for line in page_lines if line == "UNREADABLE")
+        unreadable_count += sum(1 for line in page_lines if line == UNREADABLE_MARK)
 
-        # Обновление status.json каждые N файлов, а не на каждой странице —
-        # снижает нагрузку на диск при 250-страничных PDF с большим количеством
-        # исходных файлов (в отличие от Агента 1, где мы обновляли на каждой
-        # странице ради плавности бара — здесь операция дороже по CPU,
-        # и обновление каждые 5 файлов даёт достаточную детализацию
-        # без избыточной нагрузки на I/O).
         if index % STATUS_UPDATE_INTERVAL == 0 or index == total_pages:
             status.set_progress(
                 processed_pages=index,
@@ -469,7 +389,7 @@ def run(png_dir: str, csv_dir: str, status_file: str, result_count: int) -> List
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Data Matrix OCR agent")
+    parser = argparse.ArgumentParser(description="Data Matrix OCR agent (projection-based grid detection)")
     parser.add_argument("--png_dir", required=True, help="Директория с PNG страницами (из Агента 1)")
     parser.add_argument("--csv_dir", required=True, help="Директория для сохранения результирующих файлов")
     parser.add_argument("--status_file", required=True, help="Путь к status.json")
