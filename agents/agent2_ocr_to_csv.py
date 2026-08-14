@@ -148,7 +148,7 @@ def extract_code_region(
     x_offset = (cell_width - code_side) // 2
 
     y1 = CODE_INNER_PADDING
-    y2 = int(cell_height * ratio)
+    y2 = int(cell_height * CODE_HEIGHT_RATIO)
     x1 = x_offset
     x2 = x_offset + code_side
 
