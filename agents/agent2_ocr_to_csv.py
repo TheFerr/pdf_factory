@@ -68,7 +68,7 @@ CELL_MARGIN = 3
 # При необходимости откалибровать точнее — см. функцию
 # calibrate_code_ratio_from_sample() ниже для разовой проверки на
 # конкретном образце PNG.
-CODE_HEIGHT_RATIO = 0.78
+CODE_HEIGHT_RATIO = 0.64
 
 # Небольшой дополнительный отступ внутрь найденного квадрата кода,
 # чтобы гарантированно не захватить верхний край рамки ячейки.
@@ -148,7 +148,7 @@ def extract_code_region(
     x_offset = (cell_width - code_side) // 2
 
     y1 = CODE_INNER_PADDING
-    y2 = min(cell_height, code_side + CODE_INNER_PADDING)
+    y2 = int(cell_height * ratio)
     x1 = x_offset
     x2 = x_offset + code_side
 
