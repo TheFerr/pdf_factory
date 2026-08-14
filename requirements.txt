@@ -1,1 +1,4 @@
 PyMuPDF==1.23.26
+opencv-python-headless==4.9.0.80
+pylibdmtx==0.1.10
+numpy==1.26.4

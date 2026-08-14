@@ -2,8 +2,6 @@
 """
 Оркестратор пайплайна обработки: последовательно запускает
 Агент 1 (PDF -> PNG) и Агент 2 (PNG -> распознавание -> CSV).
-
-Запускается из upload.php в фоновом режиме (nohup ... &).
 """
 
 import argparse
@@ -15,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from status_manager import StatusManager
 import agent1_pdf_to_png
-# import agent2_ocr_to_csv  # Будет подключен на следующем этапе разработки
+import agent2_ocr_to_csv
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -26,8 +24,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--csv_dir", required=True)
     parser.add_argument("--status_file", required=True)
     parser.add_argument("--result_count", type=int, required=True)
-    parser.add_argument("--files", required=True,
-                         help="Список исходных PDF через запятую")
+    parser.add_argument("--files", required=True)
     parser.add_argument("--dpi", type=int, default=200)
     return parser.parse_args()
 
@@ -39,7 +36,7 @@ def main():
 
     try:
         # ---------- Этап 1: конвертация PDF -> PNG ----------
-        pdf_to_png_map = agent1_pdf_to_png.run(
+        agent1_pdf_to_png.run(
             pdf_dir=args.pdf_dir,
             png_dir=args.png_dir,
             status_file=args.status_file,
@@ -59,18 +56,12 @@ def main():
         status.add_log("[Stage2] Инициализация распознавания кодов...")
 
         # ---------- Этап 2: распознавание -> CSV ----------
-        # Заглушка на данный момент — агент 2 будет реализован отдельно.
-        # Ожидаемый интерфейс:
-        #
-        # agent2_ocr_to_csv.run(
-        #     png_map=pdf_to_png_map,
-        #     csv_dir=args.csv_dir,
-        #     status_file=args.status_file,
-        #     result_count=args.result_count
-        # )
-
-        status.add_log("[Stage2] (заглушка) Агент распознавания пока не реализован.")
-        status.update(stage=2, status="done", percent=100, result_files=[])
+        agent2_ocr_to_csv.run(
+            png_dir=args.png_dir,
+            csv_dir=args.csv_dir,
+            status_file=args.status_file,
+            result_count=args.result_count
+        )
 
     except Exception:
         error_log_path = os.path.join(args.job_dir, "pipeline_error.log")
